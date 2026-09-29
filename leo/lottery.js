@@ -75,9 +75,13 @@
     const info = await tkcc().catch(() => null);
     const token = (info && info.token) || C.tkccToken || '';
     let dec = (info && info.decimals != null) ? Number(info.decimals) : null;
-    let symbol = 'TKCC';
+    // symbol 兜底取本站 config.tokenName（'TKCC'/'ORION'/'PICK'/'LEO'）。
+    // ⚠️ 曾经写死 'TKCC' —— 而下面这条 token_info 查询只在 decimals 缺失时才走，
+    //    奖池合约正常都带 tkcc_decimals（=6），所以这里实际上就是 symbol 的唯一来源，
+    //    会让 ORION/PICK/LEO 站的"我的"页余额标签、管理页 TKCC 状态行显示成 TKCC。
+    let symbol = C.tokenName || 'TKCC';
 
-    if (dec == null && token) {
+    if ((dec == null || !C.tokenName) && token) {
       // ⚠️ 变量名不能叫 ti —— 会遮蔽外层翻译助手 ti()
       const tinfo = await tkccTokenInfo(token);
       if (tinfo) {

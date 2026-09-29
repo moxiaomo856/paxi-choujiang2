@@ -513,7 +513,7 @@
    * 因此把"画界面"与"查链"拆开：切语言只调这里。
    */
   function renderTkccUI() {
-    $('balTkccLabel').textContent = tkccInfo.symbol || 'TKCC';
+    $('balTkccLabel').textContent = tkccInfo.symbol || SYM();
     $('tkccStatus').textContent = tkccInfo.token
       ? T('msg.tkccStatusLine', {
           addr: tkccInfo.token,
@@ -638,7 +638,8 @@
       const res = await L.lotteries(status, 100);
       // Bug-1：模板池是否展示由 config.js 的 showTemplatePools 决定。
       // 之前这里是写死的 `!l.is_template_pool`，配置改了也不生效（死配置）。
-      const list = C.showTemplatePools
+      // 现在支持三态：'admin' 仅管理员地址可见 ｜ true 所有人 ｜ false 彻底关闭。
+      const list = tplPoolsVisible()
         ? (res.lotteries || [])
         : (res.lotteries || []).filter((l) => !l.is_template_pool);
 
@@ -1225,8 +1226,9 @@
 
     const me = K.wallet.address;
     const res = await L.lotteries(null, 200).catch(() => ({ lotteries: [] }));
+    // 与奖池页同一口径：官方模板池只对管理员地址可见（非管理员连"我参与过"也不显示）
     const pools = (res.lotteries || [])
-      .filter((l) => !l.is_template_pool)
+      .filter((l) => tplPoolsVisible() || !l.is_template_pool)
       .map((l) => L.toView(l, tkccInfo.decimals));
 
     const created = [];
@@ -1354,12 +1356,21 @@
   async function refreshAdminPage() {
     if (!isAdmin) return;
     renderAdmins();
-    renderTemplateTierOptions();
-    renderMsActions();
+
+    // 两块可选面板：显示与否由 config 决定，关掉的面板不渲染、也不发链上查询
+    const tplOn = tplPanelVisible();
+    const msOn  = msPanelVisible();
+    const tplSec = $('tplSection');
+    const msSec  = $('msSection');
+    if (tplSec) tplSec.hidden = !tplOn;
+    if (msSec)  msSec.hidden  = !msOn;
+    if (tplOn) renderTemplateTierOptions();
+    if (msOn)  renderMsActions();
+
     await refreshContractInfo().catch(() => {});
     await refreshTkcc(true).catch(() => {});
-    await refreshTemplates().catch(() => {});
-    await refreshMultisig().catch(() => {});
+    if (tplOn) await refreshTemplates().catch(() => {});
+    if (msOn)  await refreshMultisig().catch(() => {});
   }
 
   /** 模板档位下拉（与奖池档位同一份配置，同样按合约版本门控） */
@@ -1391,6 +1402,27 @@
   }
 
   // =====================================================================
+  // 可见性开关：官方模板池 / 多签提案（config 驱动）
+  //
+  // 合约侧的能力一直都在（pool_template* 与 Propose/Confirm/Query 均可正常调用），
+  // 这里只决定前端"给谁看"：
+  //   showTemplatePools : 'admin' 仅管理员地址可见（默认）｜ true 所有人 ｜ false 彻底关闭
+  //   showMultisig      : true 显示 ｜ false（默认）隐藏
+  // 跟着开关走的一共两处：① 奖池列表里的官方池卡片；② 管理页的两块面板。
+  // 用 function 声明（会提升），前面 refreshPools / refreshMyPage 可先调用。
+  // =====================================================================
+  /** 奖池列表里的官方模板池卡片是否可见 */
+  function tplPoolsVisible() {
+    const v = C.showTemplatePools;
+    if (v === 'admin') return !!isAdmin;   // 只有连上管理员地址才可见
+    return v === true;
+  }
+  /** 管理页「官方模板池」面板是否显示（false = 该功能彻底关闭） */
+  function tplPanelVisible() { return !!isAdmin && C.showTemplatePools !== false; }
+  /** 管理页「多签提案」面板是否显示（默认隐藏） */
+  function msPanelVisible() { return !!isAdmin && C.showMultisig === true; }
+
+  // =====================================================================
   // 官方模板池管理（Bug-6）
   // =====================================================================
   let templatesCache = [];
@@ -1398,7 +1430,8 @@
   async function refreshTemplates() {
     const box = $('tplList');
     if (!box) return;
-    if (!isAdmin) { box.innerHTML = ''; return; }
+    // 面板不开（非管理员 / showTemplatePools === false）时既不清空也不发链上查询
+    if (!tplPanelVisible()) { box.innerHTML = ''; templatesCache = []; return; }
     let tpls = [];
     try {
       const r = await L.poolTemplates();
@@ -1535,7 +1568,7 @@
 
   function renderMsActions() {
     const sel = $('msAction');
-    if (!sel) return;
+    if (!sel || !msPanelVisible()) return;
     sel.innerHTML = MS_ACTIONS.map((a) =>
       `<option value="${a.v}">${T('admin.msAct.' + a.v)}</option>`).join('');
     refreshMsHint();
@@ -1548,7 +1581,7 @@
 
   async function refreshMultisig() {
     const el = $('msThreshold');
-    if (!el) return;
+    if (!el || !msPanelVisible()) return;
     try {
       const r = await K.queryContract({ admins: {} });
       el.textContent = T('admin.msThreshold', { t: r.threshold, n: (r.admins || []).length });
@@ -1723,9 +1756,9 @@
     const shortPaxi = needPaxi > hasPaxi;
     const shortTkcc = needTkcc > hasTkcc;
     if (!shortPaxi && !shortTkcc) return true;
-    const need = `${v.joinPaxi} PAXI + ${v.joinTkcc} TKCC`;
+    const need = `${v.joinPaxi} PAXI + ${v.joinTkcc} ${SYM()}`;
     const lack = `${shortPaxi ? L.fmtPaxi(needPaxi - hasPaxi) + ' PAXI ' : ''}`
-      + `${shortTkcc ? L.fmtTkcc(needTkcc - hasTkcc, tkccInfo.decimals) + ' TKCC' : ''}`;
+      + `${shortTkcc ? L.fmtTkcc(needTkcc - hasTkcc, tkccInfo.decimals) + ' ' + SYM() : ''}`;
     banner(T('create.balShort', { need, lack }), 'err');
     return false;
   }
@@ -1810,8 +1843,8 @@
     el.innerHTML = tiers.map((t) => `
       <div class="tier-card ${t.id === selectedTier ? 'selected' : ''}" data-tier="${t.id}">
         <h3>${t.label}<span class="badge">${T('create.peopleFull', { n: t.people })}</span></h3>
-        <div class="meta">${T('create.perJoin')}<b>${t.joinPaxi}</b> PAXI + <b>${L.fmtWan(t.joinTkcc)}</b> TKCC</div>
-        <div class="meta">${T('create.fee')}<b>${t.createPaxi}</b> PAXI + <b>${L.fmtWan(t.createTkcc)}</b> TKCC${T('create.feeNote')}</div>
+        <div class="meta">${T('create.perJoin')}<b>${t.joinPaxi}</b> PAXI + <b>${L.fmtWan(t.joinTkcc)}</b> ${SYM()}</div>
+        <div class="meta">${T('create.fee')}<b>${t.createPaxi}</b> PAXI + <b>${L.fmtWan(t.createTkcc)}</b> ${SYM()}${T('create.feeNote')}</div>
       </div>
     `).join('');
     el.querySelectorAll('.tier-card').forEach((card) => {
@@ -1833,9 +1866,9 @@
     const hasTkcc = BigInt(balTkccRaw || '0');
     const ok = hasPaxi >= needPaxi && hasTkcc >= needTkcc;
 
-    $('costCreate').textContent = `${t.createPaxi} PAXI + ${L.fmtWan(t.createTkcc)} TKCC`;
+    $('costCreate').textContent = `${t.createPaxi} PAXI + ${L.fmtWan(t.createTkcc)} ${SYM()}`;
     const balEl = $('costBal');
-    balEl.textContent = `${L.fmtPaxi(balPaxiRaw)} PAXI / ${L.fmtTkcc(balTkccRaw, tkccInfo.decimals)} TKCC`;
+    balEl.textContent = `${L.fmtPaxi(balPaxiRaw)} PAXI / ${L.fmtTkcc(balTkccRaw, tkccInfo.decimals)} ${SYM()}`;
     balEl.className = ok ? '' : 'short';
 
     const btn = $('btnCreate');
@@ -2055,20 +2088,25 @@
   }
 
   // ---- 管理页：官方模板池 ----
-  $('btnGenTplSecret').onclick = () => {
-    const s = L.randomSecret();
-    $('tplSecret').value = s;
-    const c = commitOf(s);
-    $('tplCommit').value = c;
-    $('tplCommitHint').textContent = c ? T('admin.tplCommitHint', { c }) : T('create.seedHashFail');
-  };
-  $('btnCreateTpl').onclick = () => guardBusy($('btnCreateTpl'), () => onCreateTemplate());
+  // 面板整块藏在 #tplSection 里（config.showTemplatePools 控制），绑定前先判空：
+  // 将来若某站彻底删掉这块 DOM，这里不会 TypeError 打断后面所有初始化。
+  if ($('btnGenTplSecret')) {
+    $('btnGenTplSecret').onclick = () => {
+      const s = L.randomSecret();
+      $('tplSecret').value = s;
+      const c = commitOf(s);
+      $('tplCommit').value = c;
+      $('tplCommitHint').textContent = c ? T('admin.tplCommitHint', { c }) : T('create.seedHashFail');
+    };
+  }
+  if ($('btnCreateTpl')) $('btnCreateTpl').onclick = () => guardBusy($('btnCreateTpl'), () => onCreateTemplate());
 
   // ---- 管理页：多签提案 ----
-  $('msAction').onchange = () => refreshMsHint();
-  $('btnPropose').onclick        = () => guardBusy($('btnPropose'), () => onPropose());
-  $('btnQueryProposal').onclick  = () => guardBusy($('btnQueryProposal'), () => onQueryProposal());
-  $('btnConfirmProposal').onclick = () => guardBusy($('btnConfirmProposal'), () => onConfirmProposal());
+  // 默认 config.showMultisig = false → 整块不显示；绑定照旧，改配置即恢复入口。
+  if ($('msAction')) $('msAction').onchange = () => refreshMsHint();
+  if ($('btnPropose'))         $('btnPropose').onclick         = () => guardBusy($('btnPropose'), () => onPropose());
+  if ($('btnQueryProposal'))   $('btnQueryProposal').onclick   = () => guardBusy($('btnQueryProposal'), () => onQueryProposal());
+  if ($('btnConfirmProposal')) $('btnConfirmProposal').onclick = () => guardBusy($('btnConfirmProposal'), () => onConfirmProposal());
   if (window.CJ_I18N) $('btnLang').onclick = () => window.CJ_I18N.toggle();
 
   // 语言切换：i18n.js 已自动套用静态 data-i18n 文案，这里重渲染动态内容

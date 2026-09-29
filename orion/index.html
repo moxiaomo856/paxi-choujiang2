@@ -111,7 +111,10 @@
         <div class="cost-row"><span data-i18n="create.costBal">内部余额</span><b id="costBal">—</b></div>
       </div>
 
-      <details class="collapse" id="seedBox">
+      <!-- ⏸️ 随机种子承诺（commit-reveal）暂时隐藏（用户要求）。
+           恢复方法：删掉下面 <details> 上的 hidden 属性即可，代码逻辑一行未动。
+           元素保留是必须的 —— app.js 会绑定 #useSeed / #seedSecret / #btnGenSeed。 -->
+      <details class="collapse" id="seedBox" hidden>
         <summary data-i18n="create.seedTitle">🔐 随机种子承诺（commit-reveal，可选）</summary>
         <label class="chk">
           <input type="checkbox" id="useSeed" />
@@ -218,7 +221,11 @@
         <button id="btnSetBurn" class="btn ghost" data-i18n="admin.setBurn">设置黑洞地址</button>
       </div>
 
-      <!-- ========== 官方模板池（Bug-6：合约有、前端此前零入口） ========== -->
+      <!-- ========== 官方模板池（Bug-6：合约有、前端此前零入口） ==========
+           可见性由 config.showTemplatePools 决定：
+             'admin' = 仅管理员地址可见（默认）｜ true = 所有人 ｜ false = 彻底关闭。
+           默认 hidden，连上管理员地址后由 refreshAdminPage() 解除。 -->
+      <div id="tplSection" hidden>
       <h2 class="page-title" data-i18n="admin.templates">🏛️ 官方模板池</h2>
       <p class="hint" data-i18n="admin.templatesHint">
         模板是常青官方池：有人参与就自动开新池，满员开奖后自动循环。
@@ -248,8 +255,12 @@
           secret 一经揭示即公开，绝不复用。请把整条链离线生成好并妥善保存。
         </p>
       </details>
+      </div>
 
-      <!-- ========== 多签提案（Bug-7） ========== -->
+      <!-- ========== 多签提案（Bug-7） ==========
+           整块由 config.showMultisig 控制，默认 false = 隐藏（不显示、也不发链上查询）。
+           合约仍支持 Propose / Confirm / Query，把配置改成 true 即可恢复入口。 -->
+      <div id="msSection" hidden>
       <h2 class="page-title" data-i18n="admin.multisig">🧾 多签提案</h2>
       <p class="hint" id="msThreshold"></p>
 
@@ -278,6 +289,7 @@
       <p class="hint" data-i18n="admin.msLocalHint">
         合约只有按 ID 单查提案的接口，没有列表。这里记录本机发起过的提案 ID，换设备请手动输入 ID 查询。
       </p>
+      </div>
     </section>
 
   </main>

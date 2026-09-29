@@ -80,8 +80,17 @@ window.CJ_CONFIG = {
   ],
   defaultTier: 0,
 
-  // 官方模板池：彻底隐藏（合约仍支持，前端不展示）
-  showTemplatePools: false,
+  // ==== 官方模板池 / 多签提案 的可见性（只控制前端展示，合约能力一直都在）====
+  // showTemplatePools：
+  //   'admin' —— 仅管理员地址可见（当前设置）：
+  //              奖池列表里的官方池卡片 + 管理页的「官方模板池」面板都只对管理员开放
+  //   true    —— 所有人可见（官方池会出现在奖池列表里）
+  //   false   —— 彻底关闭：列表不显示，管理页那块面板也一并隐藏
+  showTemplatePools: 'admin',
+  // showMultisig：管理页的「🧾 多签提案」面板。
+  //   false —— 隐藏（当前设置；合约仍支持 Propose/Confirm/Query，改成 true 即恢复入口）
+  //   true  —— 显示
+  showMultisig: false,
 
   // ---- 无感会话 ----
   sessionDailyLimit: '1000000000000',
