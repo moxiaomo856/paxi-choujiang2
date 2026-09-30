@@ -346,6 +346,10 @@
       'err.unauthorized': '无权限执行该操作',
       'err.zeroAmount': '数量必须大于 0',
       'err.multisig': '需要多签，请使用管理提案',
+      /* 节点侧故障（chain.js 抛出）。文案要明确"与你无关"，否则用户会去
+         转账 / 反复充值，而问题其实在 RPC/LCD 节点上。 */
+      'err.nodeUnavailable': '链上节点暂时不可用，请稍后重试（与你的账户 / 余额无关）',
+      'err.accountNotInit': '该地址尚未在链上初始化，请先接收一笔 PAXI 后再试',
 
       /* ---- 合约状态 ---- */
       'status.open': '报名中',
@@ -701,6 +705,8 @@
       'err.unauthorized': 'You are not authorized to perform this action',
       'err.zeroAmount': 'Amount must be greater than zero',
       'err.multisig': 'Multisig required — please use an admin proposal',
+      'err.nodeUnavailable': 'Chain node temporarily unavailable — please retry later (not your account or balance)',
+      'err.accountNotInit': 'This address is not initialized on chain yet — receive some PAXI first, then retry',
 
       'status.open': 'Open',
       'status.full': 'Full',

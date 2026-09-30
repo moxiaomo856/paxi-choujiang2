@@ -75,6 +75,196 @@
     return neg ? '-' + v : v;
   }
 
+  // =====================================================================
+  // RPC 直查兜底（LCD 不可用时）
+  //
+  // Paxi 主网的 LCD 是**单点**：它一旦 5xx / 超时，下面所有读接口会一起失败，
+  // 界面上表现为「奖池一直转圈」；更糟的是 buildCommon 拿不到 account_number
+  // 就报「账户尚未在链上初始化」——把节点故障说成用户账户的问题，用户会白
+  // 转一笔 PAXI 过来，而问题其实在节点侧。
+  //
+  // 但 RPC（config.rpc）的 /abci_query 走的是同一条链的应用层查询路由，
+  // 不需要 LCD 就能取到：账户号 / 序号、余额、合约 smart 查询结果。
+  // 这里做一层兜底：**只在 LCD 失败时才启用**，LCD 健康时行为完全不变。
+  // 交易广播仍走原路径（签名后 POST LCD），本层只负责读。
+  // =====================================================================
+  const PB_TE = new TextEncoder();
+  const PB_TD = new TextDecoder();
+
+  /** 无符号整数 → protobuf varint（用 BigInt，account_number 可能超 2^53） */
+  function pbVarint(n) {
+    let v = BigInt(n);
+    const out = [];
+    do {
+      let b = Number(v & 0x7fn);
+      v >>= 7n;
+      if (v > 0n) b |= 0x80;
+      out.push(b);
+    } while (v > 0n);
+    return Uint8Array.from(out);
+  }
+  function pbCat(list) {
+    let len = 0;
+    for (const u of list) len += u.length;
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const u of list) { out.set(u, off); off += u.length; }
+    return out;
+  }
+  const pbTag = (no, wt) => pbVarint((BigInt(no) << 3n) | BigInt(wt));
+  /** 编码 string 字段 */
+  function pbStr(no, s) {
+    const b = PB_TE.encode(s);
+    return pbCat([pbTag(no, 2), pbVarint(b.length), b]);
+  }
+  /** 编码 bytes 字段 */
+  function pbBytes(no, b) {
+    return pbCat([pbTag(no, 2), pbVarint(b.length), b]);
+  }
+  /**
+   * 极简 protobuf 解析：只解 varint(0) 与 length-delimited(2)，
+   * 足够读 Account / Coin / QueryXxxResponse（其余 wire type 直接跳过）。
+   * 返回 [{ no, wt, v }]：wt=2 时 v 是 Uint8Array，wt=0 时 v 是 BigInt。
+   */
+  function pbRead(buf) {
+    const out = [];
+    let i = 0;
+    const uv = () => {
+      let r = 0n, sh = 0n, x;
+      do { x = buf[i++]; r |= BigInt(x & 0x7f) << sh; sh += 7n; } while (x & 0x80);
+      return r;
+    };
+    while (i < buf.length) {
+      const key = uv();
+      const no = Number(key >> 3n);
+      const wt = Number(key & 7n);
+      if (wt === 0) out.push({ no, wt, v: uv() });
+      else if (wt === 2) {
+        const len = Number(uv());
+        out.push({ no, wt, v: buf.subarray(i, i + len) });
+        i += len;
+      } else if (wt === 5) i += 4;
+      else if (wt === 1) i += 8;
+      else throw new Error('protobuf: 未知 wire type ' + wt);
+    }
+    return out;
+  }
+  const pbGet = (fields, no) => {
+    const f = fields.find((x) => x.no === no);
+    return f ? f.v : undefined;
+  };
+
+  const bytesToHex = (u8) => {
+    let s = '';
+    for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, '0');
+    return s;
+  };
+  const b64ToBytes = (b64) => {
+    const bin = atob(b64);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  };
+
+  /**
+   * 通过 RPC /abci_query 直接问应用层要数据。
+   * path 必须是带引号的字符串字面量形式（Tendermint 参数解析要求），
+   * data 是「请求消息」的 protobuf 字节（0x 前缀 hex）。
+   * 返回 response.value 解码后的字节（查询结果消息的 protobuf）。
+   */
+  async function rpcAbciQuery(path, reqBytes) {
+    const url = `${C.rpc}/abci_query?path=${encodeURIComponent(JSON.stringify(path))}`
+      + `&data=0x${bytesToHex(reqBytes)}`;
+    /** RPC 自身不可用（连不上 / 5xx / 参数被拒）→ 标 infra，调用方据此判断 */
+    const infra = (msg) => { const e = new Error(msg); e.infra = true; return e; };
+    let res;
+    try {
+      res = await fetchWithTimeout(url, {}, 12000);
+    } catch (e) {
+      throw infra('RPC 连接失败：' + (e.message || e));
+    }
+    if (!res.ok) throw infra('RPC 查询失败 HTTP ' + res.status);
+    const j = await res.json();
+    if (j && j.error) throw infra(j.error.message || 'RPC 查询失败');
+    const r = (j && j.result && j.result.response) || {};
+    if (r.code) {
+      // code != 0 = 应用层拒绝了这次查询（合约报错 / 账户不存在…）→ 业务错误，
+      // 原样抛出去；只有日志本身自述节点故障时才算 infra。
+      const log = String(r.log || '').split('\n')[0] || ('RPC 查询失败 code=' + r.code);
+      const e = new Error(log);
+      e.infra = INFRA_ERR_RE.test(log);
+      throw e;
+    }
+    return r.value ? b64ToBytes(r.value) : new Uint8Array(0);
+  }
+
+  /** RPC 兜底：合约 smart 查询 → 已解析的 JSON */
+  async function rpcSmartQuery(address, queryJson) {
+    const raw = await rpcAbciQuery(
+      '/cosmwasm.wasm.v1.Query/SmartContractState',
+      pbCat([pbStr(1, address), pbBytes(2, PB_TE.encode(queryJson))])
+    );
+    // QuerySmartContractStateResponse{ bytes data = 1 }
+    const data = pbGet(pbRead(raw), 1);
+    if (!data) throw new Error('RPC 兜底：合约未返回数据');
+    return JSON.parse(PB_TD.decode(data));
+  }
+
+  /** RPC 兜底：账户号 / 序号（QueryAccountResponse{ Any account = 1 }） */
+  async function rpcAccount(address) {
+    const raw = await rpcAbciQuery('/cosmos.auth.v1beta1.Query/Account', pbStr(1, address));
+    const any = pbGet(pbRead(raw), 1);
+    if (!any) throw new Error('RPC 兜底：account not found（链上无此账户）');
+    const value = pbGet(pbRead(any), 2);              // Any.value
+    const ba = value ? pbRead(value) : [];            // BaseAccount
+    const num = pbGet(ba, 3);                         // account_number
+    if (num === undefined) throw new Error('RPC 兜底：账户缺少 account_number');
+    return { accountNumber: String(num), sequence: String(pbGet(ba, 4) ?? 0n) };
+  }
+
+  /** RPC 兜底：全部余额（QueryAllBalancesResponse{ repeated Coin balances = 1 }） */
+  async function rpcBalances(address) {
+    const raw = await rpcAbciQuery('/cosmos.bank.v1beta1.Query/AllBalances', pbStr(1, address));
+    return pbRead(raw)
+      .filter((f) => f.no === 1)
+      .map((f) => {
+        const c = pbRead(f.v);                        // Coin{ denom = 1, amount = 2 }
+        const d = pbGet(c, 1);
+        const a = pbGet(c, 2);
+        return { denom: d ? PB_TD.decode(d) : '', amount: a ? PB_TD.decode(a) : '0' };
+      });
+  }
+
+  /** RPC 兜底：按 txhash 取交易结果（顶层补 events / logs，兼容 extractWasmAttrs） */
+  async function rpcTxByHash(hash) {
+    const res = await fetchWithTimeout(`${C.rpc}/tx?hash=0x${String(hash).replace(/^0x/, '')}`, {}, 10000);
+    if (!res.ok) throw new Error(`RPC 查询交易失败 HTTP ${res.status}`);
+    const j = await res.json();
+    if (j && j.error) throw new Error(j.error.message || 'RPC 查询交易失败');
+    const r = (j && j.result) || {};
+    const tr = r.tx_result || {};
+    if (tr.code === undefined) throw new Error('RPC：交易尚未上链');
+    let logs = [];
+    try { logs = JSON.parse(tr.log || '[]'); } catch (_) { logs = []; }
+    return { ...tr, events: tr.events || [], logs, txhash: r.hash || hash };
+  }
+
+  /** 判断 LCD 的报错是否属于「节点侧故障」而不是「合约业务错误」 */
+  const INFRA_ERR_RE = new RegExp([
+    'invalid height', 'context did not contain', 'finalize block state',
+    'connection refused', 'connection reset', 'no such host', 'timeout', 'timed out',
+    'temporarily unavailable', 'service unavailable', 'bad gateway', 'gateway timeout',
+    'internal server error', 'context canceled', 'EOF',
+  ].join('|'), 'i');
+
+  /** 节点侧故障 → 统一的「不是你的问题」提示（原文进 log，便于排查） */
+  const nodeUnavailable = (detail) => {
+    const e = new Error('链上节点暂时不可用，请稍后重试（与你的账户 / 余额无关）。');
+    e.nodeDown = true;
+    e.detail = detail || '';
+    return e;
+  };
+
   // ---------- 钱包 ----------
   const wallet = { address: '', pubkeyHex: '' };
 
@@ -108,42 +298,116 @@
   }
 
   // ---------- 查询 ----------
-  /** 查询合约（默认查抽奖合约；传 contract 可查别的合约，如 TKCC） */
+  /**
+   * 查询合约（默认查抽奖合约；传 contract 可查别的合约，如 TKCC）。
+   *
+   * LCD 失败时自动走 RPC 兜底（见文末「RPC 直查兜底」）。注意
+   * **合约业务错误和 LCD 故障都会返回 HTTP 500**，光看状态码分不开，
+   * 所以统一再问一次 RPC：RPC 成功 = LCD 的锅；RPC 也失败 = 业务错误。
+   */
   async function queryContract(msg, contract) {
     const addr = contract || C.contract;
     if (!addr || addr.startsWith('PASTE_')) throw new Error('合约地址未配置（config.js）');
-    const url = `${C.lcd}/cosmwasm/wasm/v1/contract/${addr}/smart/${toBase64(JSON.stringify(msg))}`;
-    const res = await fetchWithTimeout(url);
-    if (!res.ok) throw new Error(`查询失败 ${res.status}`);
-    const json = await res.json();
-    if (json.code) throw new Error(json.message || '查询返回错误');
-    return json.data;
+    const payload = JSON.stringify(msg);
+    const url = `${C.lcd}/cosmwasm/wasm/v1/contract/${addr}/smart/${toBase64(payload)}`;
+    let lcdErr = null;
+    try {
+      const res = await fetchWithTimeout(url);
+      if (res.ok) {
+        const json = await res.json();
+        if (!json.code) return json.data;
+        lcdErr = new Error(json.message || '查询返回错误');
+        lcdErr.infra = INFRA_ERR_RE.test(String(json.message || ''));
+      } else {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) { body = ''; }
+        lcdErr = new Error(`查询失败 HTTP ${res.status}${body ? '：' + body.slice(0, 200) : ''}`);
+        // 只有 502/503/504 与「节点自述的故障」才算节点侧问题；
+        // 普通 500 既可能是节点故障也可能是合约 revert，交给下面的 RPC 复核。
+        lcdErr.infra = res.status === 502 || res.status === 503 || res.status === 504
+          || res.status === 429 || INFRA_ERR_RE.test(body);
+      }
+    } catch (e) {
+      lcdErr = e;
+      lcdErr.infra = true;      // 网络层失败（超时 / DNS / 中断）
+    }
+    try {
+      const data = await rpcSmartQuery(addr, payload);
+      console.warn('[chain] LCD 查询失败，已用 RPC 兜底：', lcdErr.message);
+      return data;
+    } catch (e2) {
+      // RPC 复核结果才是权威答案：它报的若是业务错误（合约 revert / 参数非法），
+      // 原样抛给 mapContractError 去翻译；RPC 自己也挂了的话，退而用 LCD 的
+      // 业务错误（若 LCD 给的是节点故障，才报"节点不可用"）。
+      if (!e2.infra) throw e2;
+      if (!lcdErr.infra) throw lcdErr;
+      throw nodeUnavailable(lcdErr.message + ' / RPC: ' + (e2.message || e2));
+    }
   }
 
   async function getBankBalances(address) {
     // 显式 10s 超时：余额查询在连接 / 轮询的关键路径上，连续弹窗时不能被
     // 单个慢 LCD 用默认 15s 拖死。
-    const res = await fetchWithTimeout(`${C.lcd}/cosmos/bank/v1beta1/balances/${address}`, {}, 10000);
-    const json = await res.json();
-    return json.balances || [];
+    try {
+      const res = await fetchWithTimeout(`${C.lcd}/cosmos/bank/v1beta1/balances/${address}`, {}, 10000);
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && Array.isArray(json.balances)) return json.balances;
+    } catch (e) { /* 落到 RPC 兜底 */ }
+    // ⚠️ 不能在这里静默 `return []`：LCD 抖动一次，"余额"就会显示成 0，
+    // 用户会以为钱没了。查不到就抛，让调用方按"未知"处理。
+    return await rpcBalances(address);
   }
 
   // ---------- paxihub 专属辅助 ----------
   /** §3.2 fetch accountNumber & sequence */
   async function buildCommon(chainId, address) {
-    const res = await fetchWithTimeout(`${C.lcd}/cosmos/auth/v1beta1/accounts/${address}`);
-    const json = await res.json();
-    const account = json.account || {};
-    const ba = account.base_account || account;
+    let accountNumber;
+    let sequence;
+    let notFound = false;
+    let lcdErr = null;
+    try {
+      const res = await fetchWithTimeout(`${C.lcd}/cosmos/auth/v1beta1/accounts/${address}`);
+      const json = await res.json().catch(() => ({}));
+      const ba = json && json.account ? (json.account.base_account || json.account) : null;
+      const raw = ba ? ba.account_number : undefined;
+      if (raw !== undefined && raw !== null && raw !== '') {
+        accountNumber = raw;
+        sequence = ba.sequence;
+      } else {
+        // 只有 404 / "not found" 才是真的"这个账户还不存在"；
+        // 其余（5xx、节点维护）是节点故障，绝不能甩锅给用户账户。
+        notFound = res.status === 404 || /not found/i.test(String((json && json.message) || ''));
+        lcdErr = notFound
+          ? new Error('账户尚未在链上初始化（account_number 缺失）。请先接收一笔 PAXI 后重试。')
+          : new Error(`账户查询失败 HTTP ${res.status}`);
+      }
+    } catch (e) {
+      lcdErr = e;               // 网络层失败（超时 / DNS / 中断）
+    }
+
+    if (accountNumber === undefined) {
+      try {
+        const acc = await rpcAccount(address);
+        accountNumber = acc.accountNumber;
+        sequence = acc.sequence;
+        console.warn('[chain] 账户查询走 RPC 兜底：', lcdErr && lcdErr.message);
+      } catch (e2) {
+        // RPC 说"没这个账户"= 链上确实没有，这才是真的没初始化（期间 LCD 可能
+        // 只给了 500，分不出 404，所以以 RPC 的结论为准）。
+        const m = String(e2.message || e2);
+        if (notFound || /not ?found|key not found/i.test(m)) {
+          throw new Error('账户尚未在链上初始化（account_number 缺失）。请先接收一笔 PAXI 后重试。');
+        }
+        // 地址本身非法之类：原样抛出，别包装成"节点故障"
+        if (!e2.infra) throw new Error('账户查询失败：' + m);
+        throw nodeUnavailable((lcdErr && lcdErr.message) + ' / RPC: ' + m);
+      }
+    }
     // ⚠️ Cosmos SDK 里 account_number 的合法值就是 0，旧实现用 String(...) !== '0'
     // 判断"未初始化"，会让 account_number=0 的真实账户（通常是新账户）直接报错。
-    const raw = ba.account_number;
-    if (raw === undefined || raw === null || raw === '') {
-      throw new Error('账户尚未在链上初始化（account_number 缺失）。请先接收一笔 PAXI 后重试。');
-    }
     return {
-      accountNumber: Number(raw),
-      sequence: Number(ba.sequence || '0'),
+      accountNumber: Number(accountNumber),
+      sequence: Number(sequence || '0'),
     };
   }
 
@@ -235,15 +499,22 @@
   async function waitForTx(hash, timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      let txr = null;
       try {
         const res = await fetchWithTimeout(`${C.lcd}/cosmos/tx/v1beta1/txs/${hash}`, {}, 10000);
         if (res.ok) {
-          const txr = (await res.json()).tx_response || {};
-          if (txr.code === 0) return { ok: true, raw: txr };
-          if (txr.code) return { ok: false, raw: txr, log: txr.raw_log };
+          txr = (await res.json()).tx_response || {};
         }
       } catch (e) {
         /* 瞬时错误，继续轮询 */
+      }
+      if (!txr) {
+        // LCD 不可用 → 用 RPC 按 hash 查（交易可能已经上链）
+        try { txr = await rpcTxByHash(hash); } catch (e) { /* 还没上链，继续等 */ }
+      }
+      if (txr) {
+        if (txr.code === 0) return { ok: true, raw: txr };
+        if (txr.code) return { ok: false, raw: txr, log: txr.raw_log || txr.log };
       }
       await sleep(1500);
     }
@@ -330,6 +601,11 @@
       body: JSON.stringify({ tx_bytes: base64Tx, mode: 'BROADCAST_MODE_SYNC' }),
     });
     if (!broadcastRes.ok) {
+      // 广播只能走 LCD（签名后 POST TxRaw），这里没有 RPC 兜底。
+      // 至少把"节点故障"和"签名/格式错误"分开，别让用户以为是自己操作错了。
+      if (broadcastRes.status >= 500) {
+        throw nodeUnavailable('广播 HTTP ' + broadcastRes.status);
+      }
       throw new Error('广播失败：HTTP ' + broadcastRes.status);
     }
     let broadcast;
@@ -385,8 +661,11 @@
     try {
       acc = await buildCommon(chainId, S.state.sessAddr);
     } catch (e) {
+      // 节点故障不是「会话没 gas」：不置 sessUnfunded，否则上层会白跑一遍
+      // 钱包签名路径（同样会失败），还给出错误的方向性提示。
       const err = new Error('会话账户尚未初始化（无 gas）：' + (e.message || e));
-      err.sessUnfunded = true;
+      err.sessUnfunded = !e.nodeDown;
+      err.nodeDown = !!e.nodeDown;
       throw err;
     }
 
@@ -470,19 +749,28 @@
     if (cachedChainId && Date.now() - cachedChainIdAt < CHAIN_ID_TTL) {
       return cachedChainId;
     }
+    let onchain = '';
     try {
       const r = await fetchWithTimeout(`${C.lcd}/cosmos/base/tendermint/v1beta1/node_info`, {}, 5000);
       const j = await r.json();
-      const onchain = j && j.default_node_info && j.default_node_info.network;
-      if (onchain) {
-        if (onchain !== C.chainId) {
-          console.warn(`chainId 不一致：config=${C.chainId}，链上=${onchain}，改用链上值`);
-        }
-        cachedChainId = onchain;
-        cachedChainIdAt = Date.now();
-        return cachedChainId;
+      onchain = (j && j.default_node_info && j.default_node_info.network) || '';
+    } catch (e) { /* 下面走 RPC 兜底 */ }
+    if (!onchain) {
+      // LCD 不可用 → 从 RPC /status 拿 network（签名原文第一段不能猜错）
+      try {
+        const r = await fetchWithTimeout(`${C.rpc}/status`, {}, 5000);
+        const j = await r.json();
+        onchain = (j && j.result && j.result.node_info && j.result.node_info.network) || '';
+      } catch (e) { /* 查不到就用 config 兜底 */ }
+    }
+    if (onchain) {
+      if (onchain !== C.chainId) {
+        console.warn(`chainId 不一致：config=${C.chainId}，链上=${onchain}，改用链上值`);
       }
-    } catch (e) { /* 查不到就用 config 兜底 */ }
+      cachedChainId = onchain;
+      cachedChainIdAt = Date.now();
+      return cachedChainId;
+    }
     cachedChainId = C.chainId;
     cachedChainIdAt = Date.now();
     return cachedChainId;
@@ -610,5 +898,8 @@
     toRaw,
     toBase64,
     fetchWithTimeout,
+    // 调试 / 自检用：LCD 挂掉时可以直接在控制台验证 RPC 兜底是否生效
+    buildCommon,
+    rpcAbciQuery,
   };
 })();

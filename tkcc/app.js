@@ -113,6 +113,11 @@
   function mapContractError(msg) {
     // 顺序敏感：靠前的优先匹配。每个子串都来自 error.rs 的 #[error(...)] 实际输出。
     const rules = [
+      // ⚠️ 节点侧故障必须排在最前：这些文案由 chain.js 抛出（LCD 5xx / 超时 /
+      // 账户查询失败），不含合约关键字，但一旦落到下面的宽规则里就会被误读成
+      // "你的余额不足""你的操作有问题"。用户需要的是"稍后重试"。
+      [/(链上节点暂时不可用|node unavailable)/i, 'err.nodeUnavailable'],
+      [/(尚未在链上初始化|account_number)/i,     'err.accountNotInit'],
       [/(already joined)/i,                     'err.alreadyJoined'],
       [/(not open for joining)/i,                'err.lotteryNotOpen'],
       [/(creator cannot join)/i,                 'err.creatorCannotJoin'],
@@ -970,7 +975,7 @@
       }
       acts.push(`<button class="btn sm ghost share-btn" data-act="share" data-id="${v.id}">${T('common.share')}</button>`);
     }
-    if (v.status === 'full') {
+    if (v.status === 'full' && !v.deadFull) {
       // commit-reveal：建池者承诺过种子且尚未揭示时，必须先揭示才能开奖
       // （合约会拒绝未揭示的开奖；到期未揭示只能退款）
       if (isCreator && v.commitHash && !v.revealed) {
@@ -978,6 +983,9 @@
       }
       acts.push(`<button class="btn sm primary" data-act="draw" data-id="${v.id}">${T('pools.draw')}</button>`);
     }
+    // ⚠️ v.deadFull（链上 full 但人数 < 满员）= 满员后有人退款 → 合约的
+    // REFUND_STARTED 已置位，开奖 100% 报错。这里不渲染开奖按钮，
+    // 只留下面的「退款」，避免给用户一个必然失败的按钮。
     // 退款按钮：已截止且未开奖 / 未退款的池，只给"参与过的人 / 建池人"看
     // （合约层面非参与者点退款会被拒，这里把按钮对齐合约，消除"点了报错"的陷阱）
     if (expired && v.status !== 'drawn' && v.status !== 'refunded' && (joined || isCreator)) {
@@ -2020,7 +2028,15 @@
   let autoTkccTried = false;
   async function autoEnableTkcc() {
     if (autoTkccTried || !C.autoEnableTkcc) return;
-    if (!isAdmin || !K.wallet.address || tkccInfo.configured || !C.tkccToken) return;
+    if (!isAdmin || !K.wallet.address || !C.tkccToken) return;
+    // ⚠️ 只有「链上明确回答：还没配置」才值得自动写。
+    //
+    // tkcc 查询失败（节点超时 / 5xx / 限流）时 configured 也是 false，
+    // 以前这里只看 configured → 每次打开页面都会自动发一笔 set_tkcc_token
+    // 交易弹钱包（实测可复现），而链上其实早就配置好了；交易还会因为
+    // 重复写入 / 本地签名对不上而失败，最后甩出一句"自动启用未成功"。
+    // chainOk 为 false 时一律不自动发交易，管理员可在管理页手动点一次。
+    if (!tkccInfo.chainOk || tkccInfo.configured) return;
     autoTkccTried = true;
     log(T('msg.tkccAutoStart'));
     try {
