@@ -72,7 +72,20 @@
   }
 
   async function resolveTkcc() {
-    const info = await tkcc().catch(() => null);
+    // ⚠️ 必须区分「链上明确回答：尚未配置」与「这次查询没成功」，两者以前都是
+    //    configured=false。app.js 的 autoEnableTkcc 只看 configured → 节点抖一下
+    //    （超时 / 5xx / 限流）就会自动发一笔 set_tkcc_token 交易弹钱包确认，
+    //    而链上其实早就配置好了 —— 用户看到的就是"老是弹出自动写入 TKCC"。
+    //    chainOk 表示这条查询真的拿到了链上答案，只有它为 true 时
+    //    configured=false 才可信。
+    let info = null;
+    let chainOk = false;
+    try {
+      info = await tkcc();
+      chainOk = !!(info && typeof info === 'object');
+    } catch (_) {
+      chainOk = false;
+    }
     const token = (info && info.token) || C.tkccToken || '';
     let dec = (info && info.decimals != null) ? Number(info.decimals) : null;
     // symbol 兜底取本站 config.tokenName（'TKCC'/'ORION'/'PICK'/'LEO'）。
@@ -96,6 +109,7 @@
       decimals: dec,
       symbol,
       configured: !!(info && info.configured),
+      chainOk,                      // 链上是否真的给出了答案（见函数头注释）
       burnMode: (info && info.burn_mode) || null,
       burnAddress: (info && info.burn_address) || null,
     };
@@ -415,7 +429,17 @@
     // 统一派生"可操作状态"：链上 open 只代表"未开奖"，一个正在收人的池
     // 与一个时间到了、没满员、只能退款的死池，链上状态都是 open。
     // 这里把它俩拆开，让排序 / 徽章 / 退款按钮全部由同一份派生状态驱动，不再自相矛盾。
-    const statusView = (l.status === 'open' && expired) ? 'expired' : l.status;
+    //
+    // ⚠️ full 也要一起判：合约里 `Full` **只在 `participant_count >= max_people`
+    //    时写入**（lottery.rs join），所以「链上是 full 但人数 < 满员数」一定是
+    //    满员之后又有人退款了 —— 而 execute_refund 一旦被参与者调用就会置
+    //    REFUND_STARTED，execute_draw_lottery 第一道闸就是它 → **开奖被永久封禁**，
+    //    该池只剩"退款"一条路，链上状态却永远停在 full。
+    //    前端以前照实显示"已满员"，于是它带着一个必然失败的开奖按钮，永远赖在
+    //    「进行中」列表里（典型就是 tkcc 站的 2 号奖池：full 2/5、已过期、模板池）。
+    const deadFull = l.status === 'full'
+      && Number(l.participant_count) < Number(l.max_people);
+    const statusView = (deadFull || (l.status === 'open' && expired)) ? 'expired' : l.status;
     return {
       id: l.id,
       creator: l.creator,
@@ -438,6 +462,7 @@
       statusView,                  // 派生"可操作状态"（排序 + 徽章用）
       statusText: statusText(statusView),
       expired,
+      deadFull,                    // 满员后又发生退款 → 开奖已被合约永久封禁
       expiresAt,
       expiresText: new Date(expiresAt).toLocaleString(
         window.CJ_I18N && window.CJ_I18N.getLang() === 'en' ? 'en-US' : 'zh-CN'
